@@ -1,0 +1,25 @@
+# --- secrets ---
+.env
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- agent runtime output ---
+staging/
+accepted/
+corpus/
+agent_memory.json
+cycle_report.json
+
+# --- virtualenv (if created here) ---
+.venv/
+venv/
+
+# --- editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
