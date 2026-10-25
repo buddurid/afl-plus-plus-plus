@@ -141,13 +141,45 @@ def _run_showmap(input_path: str) -> tuple[frozenset[int], bool]:
 
 
 def load_corpus(corpus_dir: str | None = None) -> list[str]:
+    """Collect candidate input files from a corpus directory.
+
+    Robust to real-world layouts:
+      - plain directory of files
+      - AFL++ sync dirs (default/queue/, */queue/, fuzzy hash names)
+      - nested project subdirs (e.g. corpus/<project>/ produced by
+        tools/ossfuzz_pull.py)
+    Skips empty files, AFL++ metadata (fuzzer_stats, .state, ...), and
+    deduplicates by content hash so per-seed showmap work isn't wasted.
+    """
     d = corpus_dir or CONFIG.corpus_dir
     if not os.path.isdir(d):
         return []
-    out = []
-    for root, _dirs, files in os.walk(d):
+
+    SKIP_NAMES = {
+        "fuzzer_stats", "plot_data", "auto_dict.txt", "state",
+        ".cur_input", "README", "README.txt", ".gitkeep", ".gitignore",
+    }
+    SKIP_DIRS = {".state", ".git", "crashes", "hangs", ".svn"}
+
+    out: list[str] = []
+    seen: set[bytes] = set()
+    for root, dirs, files in os.walk(d):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not x.startswith(".")]
         for f in sorted(files):
-            out.append(os.path.join(root, f))
+            if f in SKIP_NAMES or f.endswith((".log", ".txt", ".md", ".options", ".dict")):
+                continue
+            p = os.path.join(root, f)
+            try:
+                if os.path.getsize(p) == 0:
+                    continue
+                with open(p, "rb") as fh:
+                    blob = fh.read(4096)
+                if blob in seen:
+                    continue
+                seen.add(blob)
+            except OSError:
+                continue
+            out.append(p)
     return out
 
 
@@ -161,7 +193,7 @@ def analyze(corpus_dir: str | None = None) -> CoverageSnapshot:
     for path in load_corpus(corpus_dir):
         try:
             with open(path, "rb") as fh:
-                data = fh.read(CONFIG.max_input_size * 4)
+                data = fh.read(CONFIG.max_input_size)
         except OSError:
             continue
         edges, _bad = _run_showmap(path)

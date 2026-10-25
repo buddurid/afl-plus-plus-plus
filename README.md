@@ -1,6 +1,11 @@
 # Fuzzing Agent
 
-LLM-guided fuzzing orchestrator on top of AFL++.
+LLM-guided fuzzing orchestrator built on AFL++ (and any OpenAI-compatible LLM endpoint).
+
+The agent is **target-agnostic and corpus-source-agnostic**: everything
+specific to a project lives in `agent/.env`. Real-world corpora (from your
+own AFL++ sessions or OSS-Fuzz) are prepared by `tools/ossfuzz_pull.py` in
+the repo root — the agent itself never changes.
 
 ## Modules
 
@@ -63,7 +68,85 @@ own sequence of actions. Guardrails: max `FUZZ_AGENT_MAX_STEPS` tool actions
 
 ## Notes
 
-- Target invocation modes: `@@` (argv file), `@-` (file path in place of the
-  marker), or no marker → input piped to stdin.
+- Target invocation modes: `@@` (argv file), `-f @@` (target opens the file
+  itself), `@-` (file path in place of the marker), or no marker → input
+  piped to stdin.
+
+## Real-world onboarding
+
+Everything below requires **zero code changes** — only `agent/.env` edits.
+
+### 1. Point the agent at your target
+
+```ini
+FUZZ_TARGET_CMD=/work/myproj/fuzz_target @@     # or "-f @@" / stdin mode
+FUZZ_TARGET_DIR=/work/myproj
+FUZZ_SOURCE_DIR=/work/myproj/src                # optional, improves LLM context
+```
+
+### 2. Start fuzzing yourself (AFL++)
+
+```sh
+afl-fuzz -i seeds/ -o /work/myproj/afl_out -- /work/myproj/fuzz_target @@
+```
+
+Then let the agent consume/refine that session:
+
+```ini
+FUZZ_CORPUS_DIR=/work/myproj/afl_out   # sync dirs understood natively
+```
+
+### 3. Pull a corpus from OSS-Fuzz and continue on it
+
+From the repo root (the tool lives outside `agent/` on purpose):
+
+```sh
+# official path (needs gcloud auth; see OSS-Fuzz "Accessing Corpora" docs)
+python3 tools/ossfuzz_pull.py --gcloud \
+  "gs://<project>-corpus.clusterfuzz-external.appspot.com/libFuzzer/<fuzz_target>" \
+  --project <project>
+
+# or any public seed-corpus zip
+python3 tools/ossfuzz_pull.py --url https://.../<target>_seed_corpus.zip --project <project>
+
+# or from a local dir / zip / AFL++ session
+python3 tools/ossfuzz_pull.py --from ~/afl_out --project mytarget
+```
+
+The tool flattens AFL++ sync layouts, drops `fuzzer_stats`/crash/hang
+garbage, dedupes by hash, and lands inputs in `agent/corpus/<project>/`.
+Then set `FUZZ_CORPUS_DIR=./corpus` (the default) and run the agent.
+
+### 4. Per-project workspaces
+
+Use absolute paths in `.env` so memory/reports don't tangle between projects:
+
+```ini
+FUZZ_CORPUS_DIR=/work/myproj/corpus
+FUZZ_STAGING_DIR=/work/myproj/staging
+FUZZ_ACCEPTED_DIR=/work/myproj/accepted
+FUZZ_MEMORY_PATH=/work/myproj/agent_memory.json
+FUZZ_REPORT_PATH=/work/myproj/cycle_report.json
+```
+
+### 5. Function/line coverage for real targets
+
+Build a gcov copy of the target once and point the agent at it:
+
+```sh
+mkdir /work/myproj/gcov && cd /work/myproj/gcov
+CC=gcc CFLAGS="--coverage" <your normal build>
+```
+
+```ini
+FUZZ_GCOV_BUILD_DIR=/work/myproj/gcov
+FUZZ_GCOV_TARGET_CMD=./fuzz_target @@
+```
+
+### 6. Sanitizer builds
+
+Point `FUZZ_TARGET_CMD` at your ASan/UBSan build; crash inputs get flagged
+by the validator (empty edge sets + nonzero rc) and never enter the corpus.
+Crash triage is a future module — the validator currently just rejects them.
 - Candidate inputs are capped at `FUZZ_MAX_INPUT_SIZE` bytes; the validator
   has an execution budget (`FUZZ_VALIDATE_BUDGET`) per cycle.
