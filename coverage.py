@@ -30,6 +30,9 @@ class Seed:
 class CoverageSnapshot:
     seeds: list[Seed] = field(default_factory=list)
     all_edges: set[int] = field(default_factory=set)
+    # Optional rich coverage (function/line level, gcov-backed). None when
+    # FUZZ_GCOV_BUILD_DIR is not configured.
+    source_coverage: "object | None" = None  # funcs_coverage.SourceCoverage
 
     @property
     def num_edges(self) -> int:
@@ -38,6 +41,17 @@ class CoverageSnapshot:
     def top_seeds(self, n: int) -> list[Seed]:
         """Seeds ranked by edge count (most coverage first)."""
         return sorted(self.seeds, key=lambda s: len(s.edges), reverse=True)[:n]
+
+    def render_context(self) -> str:
+        """Full context block for LLM prompts: edges + functions/lines."""
+        ctx = [
+            f"total corpus seeds: {len(self.seeds)}",
+            f"total edges covered: {self.num_edges}",
+        ]
+        if self.source_coverage is not None:
+            ctx.append("FUNCTION/LINE COVERAGE (gcov):")
+            ctx.append(self.source_coverage.render_for_llm())
+        return "\n".join(ctx)
 
 
 class _TargetCmd:
@@ -153,4 +167,27 @@ def analyze(corpus_dir: str | None = None) -> CoverageSnapshot:
         edges, _bad = _run_showmap(path)
         snap.seeds.append(Seed(path=path, data=data, edges=edges))
         snap.all_edges |= edges
+
+    # Optional richer layer: functions/lines via a gcov-instrumented build
+    if CONFIG.gcov_build_dir and snap.seeds:
+        from .funcs_coverage import analyze_source_coverage, run_with_gcov
+        from .config import CONFIG as C
+
+        gcov_cmd = C.gcov_target_cmd or CONFIG.target_cmd
+
+        def build_cmd_fn(input_path: str) -> list[str]:
+            base = gcov_cmd.split()
+            if "@@" in base:
+                i = base.index("@@")
+                if i > 0 and base[i - 1] == "-f":
+                    return base[: i - 1] + ["-f", input_path] + base[i + 1 :]
+                return base[:i] + [input_path] + base[i + 1 :]
+            if "@-" in base:
+                i = base.index("@-")
+                return base[:i] + [input_path] + base[i + 1 :]
+            return base
+
+        snap.source_coverage = analyze_source_coverage(
+            [(s.name, s.data) for s in snap.seeds], build_cmd_fn
+        )
     return snap

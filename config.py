@@ -48,6 +48,12 @@ class Config:
     showmap_bin: str = _env("FUZZ_SHOWMAP", "afl-showmap")
     # Number of top seeds per call to feed the LLM
     max_seed_samples: int = int(_env("FUZZ_MAX_SEED_SAMPLES", "8"))
+    # Optional gcov-instrumented build of the target (directory containing the
+    # binary compiled with `gcc --coverage`). Enables function/line coverage:
+    # set to "" to disable. Example: /tmp/gcov_build
+    gcov_build_dir: str = _env("FUZZ_GCOV_BUILD_DIR", "")
+    # Command template for the gcov binary (defaults to target_cmd)
+    gcov_target_cmd: str = _env("FUZZ_GCOV_TARGET_CMD", "")
 
     # --- Plateau detection -------------------------------------------------
     plateau_cycles: int = int(_env("FUZZ_PLATEAU_CYCLES", "3"))

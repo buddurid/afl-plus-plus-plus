@@ -118,8 +118,7 @@ FUNCTIONS IN TARGET:
 {fn_block}
 
 COVERAGE SNAPSHOT:
-- total corpus seeds: {len(snap.seeds)}
-- total edges covered: {snap.num_edges}
+{snap.render_context()}
 - top seeds:
 {seed_lines}
 """
@@ -156,7 +155,7 @@ def propose_surfaces(llm: LLM, snap: CoverageSnapshot, prior_summary: str = "") 
     user = f"""\
 CURRENT CORPUS (top seeds):
 {seed_lines}
-TOTAL EDGES COVERED: {snap.num_edges}
+{snap.render_context()}
 
 PREVIOUS CYCLES SUMMARY:
 {prior_summary or "(first cycle)"}
