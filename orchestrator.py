@@ -156,7 +156,17 @@ def main() -> None:
         help="run the workflow as a LangGraph state machine (agent<->tools "
              "graph with checkpointing)",
     )
+    ap.add_argument(
+        "--status", action="store_true",
+        help="print current campaign coverage (edges, functions, source "
+             "files, zero-cov) and exit — no LLM, no AI workflow",
+    )
     args = ap.parse_args()
+
+    if args.status:
+        from .status import print_status
+        print_status()
+        return
 
     llm = get_llm()
     mem = Memory()
