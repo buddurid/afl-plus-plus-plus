@@ -8,49 +8,73 @@ from typing import Optional
 
 from .config import CONFIG
 from .coverage import CoverageSnapshot
+from .featurizer import behavior_brief, build_subsystems
 from .llm import LLM
 
 
 MAPPER_SYSTEM = """\
-You are a fuzzing coverage analyst. You receive:
-1. A list of functions in the target (extracted from source or binary symbols).
-2. Coverage statistics: which seeds hit how many edges, and how edges cluster.
-3. Optional source code excerpts.
+You are a fuzzing coverage analyst specialised in reaching DARK CODE.
 
-Your job: infer WHICH FUNCTIONALITY is already exercised and WHICH nearby
-functionality is NOT exercised ("near-miss" targets), and produce concrete
-hypotheses about what input characteristics would reach new code.
+You receive llvm-cov coverage of the target, grouped by SUBSYSTEM (source
+file), with the public entry points and functions that are NEVER executed,
+and real source excerpts of the darkest functions.
 
-Be specific: name functions, flags, magic bytes, format fields, parsers.
+Your job is NOT to enumerate functions. Your job is to read the code and
+answer, in behavioural terms:
+  1. WHAT KIND OF BEHAVIOUR have we been triggering so far? (describe the
+     code paths the corpus actually drives)
+  2. WHICH FEATURES / SUBSYSTEMS are we failing to reach? For each, name the
+     concrete FEATURE (a capability the program has, in words — not just a
+     symbol or file name).
+  3. For each dark feature, explain the PRECONDITION that gates it: what makes
+     the target *enter* that code? A control/option flag, a specific construct
+     in the input, a referenced external resource, an encoding, a size or
+     alignment boundary, a multi-chunk split, a required header, etc.
+  4. Give a precise, format-aware INPUT RECIPE that satisfies that precondition
+     for THIS harness, grounded in the source you were shown.
+
+Think about the harness: fuzz inputs are usually STRUCTURED, not raw payloads.
+A leading header of control fields, then a body; a feature is often gated by a
+header bit/field OR by a construct in the body — identify which, and say the
+exact value or construct to set.
+
+Be concrete and code-grounded. Cite the function names and constants you saw.
 Respond ONLY with JSON matching the schema:
 {
-  "covered_functionality": ["..."],
+  "triggered_behaviour": ["what behaviour we ARE exercising, in words"],
   "near_miss": [
     {
-      "functions": ["..."],
-      "reasoning": "why it's close but not reached",
-      "hint": "input characteristics likely to reach it"
+      "feature": "short name of the dark FEATURE (behaviour, not symbol)",
+      "functions": ["entry point / key functions that implement it"],
+      "precondition": "exact condition that gates entry to this code",
+      "reasoning": "why it is currently unreached, grounded in the code",
+      "hint": "precise input recipe (option/flag / construct / encoding) to reach it"
     }
   ],
-  "summary": "one-paragraph state of coverage"
+  "summary": "state of coverage in behavioural terms"
 }
 """
 
 
 SURFACE_SYSTEM = """\
 You are a security researcher hunting for unexplored attack surface.
-You receive the target's source code (or function/symbol list) and the
-current coverage state. Coverage has PLATEAUED: mutations no longer find
-new edges. Your job is to propose ENTIRELY NEW input classes that the
-current corpus has never resembled — new file formats, protocol states,
-rare CLI/env-driven paths, deep parser combinations, boundary encodings.
 
+You receive the target's source (excerpts of the darkest subsystems) and the
+current behavioural coverage state. Coverage has PLATEAUED: mutation no longer
+finds new edges. Your job is to propose ENTIRELY NEW input classes that drive
+whole FEATURES the corpus has never triggered — features gated behind control
+fields, rarely-used formats, alternate entry points, deeply nested structures,
+extreme boundaries, encodings, or externally referenced resources.
+
+For each surface, be specific about the PRECONDITION and the input recipe.
 Respond ONLY with JSON matching the schema:
 {
   "attack_surfaces": [
     {
       "name": "short label",
+      "feature": "the behaviour this unlocks",
       "entry_point": "function or path that handles it",
+      "precondition": "what must be true for the target to enter this code",
       "rationale": "why it is likely uncovered",
       "input_description": "precise description of a triggering input"
     }
@@ -64,10 +88,19 @@ class Hypothesis:
     functions: list[str] = field(default_factory=list)
     reasoning: str = ""
     hint: str = ""
+    feature: str = ""
+    precondition: str = ""
 
     def render(self) -> str:
         fns = ", ".join(self.functions) if self.functions else "(unspecified)"
-        return f"[{fns}] {self.hint} ({self.reasoning})"
+        parts = []
+        if self.feature:
+            parts.append(f"FEATURE: {self.feature}")
+        parts.append(f"functions: {fns}")
+        if self.precondition:
+            parts.append(f"precondition: {self.precondition}")
+        parts.append(f"inputs: {self.hint} ({self.reasoning})")
+        return "\n    ".join(parts)
 
 
 @dataclass
@@ -76,6 +109,8 @@ class AttackSurface:
     entry_point: str = ""
     rationale: str = ""
     input_description: str = ""
+    feature: str = ""
+    precondition: str = ""
 
 
 def _collect_function_names() -> list[str]:
@@ -103,6 +138,19 @@ def _collect_function_names() -> list[str]:
     return sorted(names)[:300]
 
 
+def _function_block(snap: CoverageSnapshot) -> str:
+    """Behaviour-oriented coverage context for prompts, best source first:
+    1. feature/subsystem gap analysis from the llvm-cov digest (+ source)
+    2. crude grep over FUZZ_SOURCE_DIR
+    """
+    oc = getattr(snap, "ossfuzz_coverage", None)
+    if oc is not None and (oc.functions or oc.files):
+        return behavior_brief(oc, CONFIG.source_dir,
+                              harness_file=CONFIG.harness_file)
+    fns = _collect_function_names()
+    return "\n".join(fns) if fns else "(no source dir configured)"
+
+
 def map_coverage(llm: LLM, snap: CoverageSnapshot) -> dict:
     """LLM-assisted mapping of coverage to functionality. Returns raw dict."""
     top = snap.top_seeds(CONFIG.max_seed_samples)
@@ -110,16 +158,14 @@ def map_coverage(llm: LLM, snap: CoverageSnapshot) -> dict:
         f"- {s.name}: {len(s.edges)} edges, first bytes: {s.data[:48]!r}"
         for s in top
     )
-    fns = _collect_function_names()
-    fn_block = "\n".join(fns) if fns else "(no source dir configured)"
+    fn_block = _function_block(snap)
 
     user = f"""\
-FUNCTIONS IN TARGET:
 {fn_block}
 
 COVERAGE SNAPSHOT:
 {snap.render_context()}
-- top seeds:
+- top seeds (these exist TODAY; your recipes must go BEYOND their shapes):
 {seed_lines}
 """
 
@@ -127,25 +173,11 @@ COVERAGE SNAPSHOT:
 
 
 def propose_surfaces(llm: LLM, snap: CoverageSnapshot, prior_summary: str = "") -> list[AttackSurface]:
-    """Plateau mode: propose wholly new attack surfaces."""
-    context = []
-    if CONFIG.source_dir and os.path.isdir(CONFIG.source_dir):
-        # include a bounded sample of source for grounding
-        budget = 8000
-        collected: list[str] = []
-        for root, _dirs, files in os.walk(CONFIG.source_dir):
-            for f in sorted(files):
-                if not f.endswith((".c", ".h", ".cc", ".cpp")):
-                    continue
-                p = os.path.join(root, f)
-                try:
-                    with open(p, encoding="utf-8", errors="replace") as fh:
-                        collected.append(f"--- {p} ---\n" + fh.read(budget))
-                except OSError:
-                    continue
-                if sum(len(c) for c in collected) > budget * 6:
-                    break
-        context.append("\n".join(collected)[: budget * 6])
+    """Plateau mode: propose wholly new attack surfaces, grounded in dark code."""
+    oc = getattr(snap, "ossfuzz_coverage", None)
+    dark = behavior_brief(oc, CONFIG.source_dir, harness_file=CONFIG.harness_file) if oc is not None else ""
+    if not dark:
+        dark = _function_block(snap)
 
     top = snap.top_seeds(CONFIG.max_seed_samples)
     seed_lines = "\n".join(
@@ -153,14 +185,14 @@ def propose_surfaces(llm: LLM, snap: CoverageSnapshot, prior_summary: str = "") 
         for s in top
     )
     user = f"""\
+{dark}
+
 CURRENT CORPUS (top seeds):
 {seed_lines}
 {snap.render_context()}
 
 PREVIOUS CYCLES SUMMARY:
 {prior_summary or "(first cycle)"}
-
-{'SOURCE CODE:' + chr(10) + chr(10).join(context) if context else '(no source available)'}
 """
     data = llm.chat_json(SURFACE_SYSTEM, user)
     return [
@@ -169,6 +201,8 @@ PREVIOUS CYCLES SUMMARY:
             entry_point=a.get("entry_point", ""),
             rationale=a.get("rationale", ""),
             input_description=a.get("input_description", ""),
+            feature=a.get("feature", ""),
+            precondition=a.get("precondition", ""),
         )
         for a in data.get("attack_surfaces", [])
     ][:6]

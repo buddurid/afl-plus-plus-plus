@@ -171,6 +171,26 @@ def main() -> None:
     llm = get_llm()
     mem = Memory()
 
+    import signal
+
+    def _handle_sigterm(signum, frame):
+        """SIGTERM (e.g. from a driver timeout) -> write a forced-finalize
+        report so the cycle's partial results aren't lost."""
+        ctx: dict = globals().get("_cycle_ctx") or {}
+        report = {
+            "mode": "langgraph" if (args.langgraph or args.agentic) else "default",
+            "verdict": "timed out (SIGTERM) before finalize_cycle",
+            "accepted": ctx.get("accepted_this_cycle", 0),
+            "new_edges": ctx.get("new_edges_this_cycle", 0),
+            "candidates": ctx.get("generated_total", 0),
+            "duration_sec": -1,
+            "forced_finalize": True,
+        }
+        _write_report(report)
+        raise SystemExit(130)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     def _cycle() -> dict:
         if args.langgraph:
             from .graph import run_langgraph_cycle
@@ -181,7 +201,8 @@ def main() -> None:
         return run_cycle(llm, mem)
 
     if args.once:
-        _cycle()
+        report = _cycle()
+        _write_report(report)
         return
 
     while True:

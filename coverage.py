@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -33,6 +34,9 @@ class CoverageSnapshot:
     # Optional rich coverage (function/line level, gcov-backed). None when
     # FUZZ_GCOV_BUILD_DIR is not configured.
     source_coverage: "object | None" = None  # funcs_coverage.SourceCoverage
+    # Optional function coverage from the OSS-Fuzz llvm-cov pipeline
+    # (tools/ossfuzz_coverage.py). None when FUZZ_OSSFUZZ_REPORT_DIR is unset.
+    ossfuzz_coverage: "object | None" = None  # ossfuzz_funcs.OssfuzzCoverage
 
     @property
     def num_edges(self) -> int:
@@ -51,6 +55,9 @@ class CoverageSnapshot:
         if self.source_coverage is not None:
             ctx.append("FUNCTION/LINE COVERAGE (gcov):")
             ctx.append(self.source_coverage.render_for_llm())
+        if self.ossfuzz_coverage is not None:
+            ctx.append("FUNCTION COVERAGE (oss-fuzz llvm-cov):")
+            ctx.append(self.ossfuzz_coverage.render_for_llm())
         return "\n".join(ctx)
 
 
@@ -183,6 +190,85 @@ def load_corpus(corpus_dir: str | None = None) -> list[str]:
     return out
 
 
+def load_live_queue(seen: set[bytes] | None = None) -> list[str]:
+    """Newest inputs of the live AFL campaign queue(s).
+
+    When FUZZ_LIVE_QUEUE_DIRS is set (colon- or comma-separated), the agent's
+    snapshot is widened to include the running campaign's queue. This makes
+    "accepted" mean "adds edges the whole campaign doesn't already have", so
+    agent inputs genuinely advance the campaign instead of being discarded by
+    AFL's own import dedup.
+    """
+    spec = CONFIG.live_queue_dirs
+    if not spec:
+        return []
+    seen = seen if seen is not None else set()
+    roots: list[str] = []
+    for raw in spec.replace(",", ":").split(":"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        roots.append(raw)
+
+    files: list[tuple[float, str]] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            p = os.path.join(root, name)
+            try:
+                if not os.path.isfile(p) or os.path.getsize(p) == 0:
+                    continue
+                files.append((os.path.getmtime(p), p))
+            except OSError:
+                continue
+    files.sort(reverse=True)  # newest first
+
+    out: list[str] = []
+    for _mtime, p in files:
+        if len(out) >= CONFIG.live_queue_max:
+            break
+        try:
+            with open(p, "rb") as fh:
+                blob = fh.read(4096)
+        except OSError:
+            continue
+        if blob in seen:
+            continue
+        seen.add(blob)
+        out.append(p)
+    return out
+
+
+def _showmap_cache() -> dict[str, list[int]]:
+    """Disk cache of per-input showmap results.
+
+    Keyed by sha256 of the input content; lives next to the agent memory
+    file so different experiments don't cross-contaminate. Lets repeated
+    read_coverage calls skip re-executing the whole (stable) corpus.
+    """
+    path = CONFIG.memory_path + ".showmap_cache.json"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _showmap_cache_save(cache: dict[str, list[int]]) -> None:
+    path = CONFIG.memory_path + ".showmap_cache.json"
+    # prune oldest entries if very large (hash keys insertion-ordered)
+    if len(cache) > 5000:
+        keep = sorted(cache.keys())[:5000]  # py3.7+ dicts are ordered
+        cache = {k: cache[k] for k in keep}
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh)
+    except OSError:
+        pass
+
+
 def analyze(corpus_dir: str | None = None) -> CoverageSnapshot:
     """Build a full coverage snapshot of the current corpus.
 
@@ -190,15 +276,37 @@ def analyze(corpus_dir: str | None = None) -> CoverageSnapshot:
     and generator to reason about which seed reaches what.
     """
     snap = CoverageSnapshot()
-    for path in load_corpus(corpus_dir):
+    cache = _showmap_cache()
+    cache_dirty = False
+    seen_blobs: set[bytes] = set()
+    # Base corpus first, then the live campaign queue (so "accepted" means
+    # beats the whole running campaign, not just the static seed set).
+    paths = list(load_corpus(corpus_dir))
+    for p in paths:
+        try:
+            with open(p, "rb") as fh:
+                seen_blobs.add(fh.read(4096))
+        except OSError:
+            continue
+    paths += load_live_queue(seen=seen_blobs)
+
+    for path in paths:
         try:
             with open(path, "rb") as fh:
                 data = fh.read(CONFIG.max_input_size)
         except OSError:
             continue
-        edges, _bad = _run_showmap(path)
+        key = hashlib.sha256(data).hexdigest()
+        if key in cache:
+            edges = frozenset(cache[key])
+        else:
+            edges, _bad = _run_showmap(path)
+            cache[key] = sorted(edges)
+            cache_dirty = True
         snap.seeds.append(Seed(path=path, data=data, edges=edges))
         snap.all_edges |= edges
+    if cache_dirty:
+        _showmap_cache_save(cache)
 
     # Optional richer layer: functions/lines via a gcov-instrumented build
     if CONFIG.gcov_build_dir and snap.seeds:
@@ -222,4 +330,11 @@ def analyze(corpus_dir: str | None = None) -> CoverageSnapshot:
         snap.source_coverage = analyze_source_coverage(
             [(s.name, s.data) for s in snap.seeds], build_cmd_fn
         )
+
+    # Optional richer layer #2: function coverage from the OSS-Fuzz
+    # llvm-cov pipeline (precomputed digest, no per-input exec needed)
+    if CONFIG.ossfuzz_report_dir:
+        from .ossfuzz_funcs import load_ossfuzz_coverage
+
+        snap.ossfuzz_coverage = load_ossfuzz_coverage()
     return snap

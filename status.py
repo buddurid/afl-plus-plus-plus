@@ -50,7 +50,7 @@ def print_status(top_n: int = 15) -> None:
     # --- function / line coverage (gcov) ----------------------------------
     sc = snap.source_coverage
     if sc is None:
-        print("\nfunction/line coverage: DISABLED")
+        print("\nfunction/line coverage (gcov): DISABLED")
         print("  (set FUZZ_GCOV_BUILD_DIR in agent/.env to enable)")
     else:
         print(f"\nfunctions reached ({len(sc.all_functions)}):")
@@ -78,6 +78,33 @@ def print_status(top_n: int = 15) -> None:
                 print(f"  {fn}")
             if len(zc) > top_n:
                 print(f"  ... and {len(zc) - top_n} more")
+
+    # --- function coverage (OSS-Fuzz llvm-cov digest) ----------------------
+    oc = getattr(snap, "ossfuzz_coverage", None)
+    if oc is not None:
+        t = oc.totals
+        print(f"\nfunction coverage (oss-fuzz llvm-cov, target={oc.target}):")
+        for metric in ("functions", "lines", "regions", "branches"):
+            v = t.get(metric)
+            if v:
+                print(f"  {metric:<10} {v['covered']:>6}/{v['total']:<7} ({v['pct']}%)")
+        hot = oc.hit_functions[:top_n]
+        if hot:
+            print(f"\ntop executed functions (by hits):")
+            for f in hot:
+                print(f"  {f.name:<45} {f.count:>9}  {f.file}:{f.line}")
+        zc = sorted(oc.zero_cov_functions)
+        if zc:
+            print(f"\nNEVER-EXECUTED functions ({len(zc)}):")
+            for fn in zc[:top_n]:
+                print(f"  {fn}")
+            if len(zc) > top_n:
+                print(f"  ... and {len(zc) - top_n} more")
+        worst = [f for f in oc.files if f["lines_covered"] == 0][:top_n]
+        if worst:
+            print(f"\nuncovered source files (top by size):")
+            for f in worst:
+                print(f"  {f['file']:<45} 0/{f['lines_total']} lines")
 
     # --- memory snapshot ---------------------------------------------------
     try:

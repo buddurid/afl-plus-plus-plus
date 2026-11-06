@@ -22,34 +22,59 @@ AGENT_SYSTEM = """\
 You are the orchestrator agent of an LLM-guided fuzzing system built on AFL++.
 You run one CYCLE now, autonomously, by choosing which tools to call and when.
 
-MISSION: maximize new edge coverage of the target by intelligently creating
-new corpus inputs.
+MISSION: reach DARK CODE — subsystems and features of the target that the
+current campaign never triggers. You are not maximising raw edge count; you
+are unlocking whole behaviours that are currently unreachable by mutation.
+
+THINK IN TERMS OF BEHAVIOUR AND FEATURES, NOT EDGES:
+- Do not just ask "what edges are missing". Ask "what does this program DO
+  that we never see it do?" — name the untriggered capability in words.
+- Read the source you are given. For each dark subsystem, identify the exact
+  PRECONDITION that gates entry (a control/option flag, a required construct
+  in the input, an external reference, an encoding, a size/alignment
+  boundary, a multi-chunk split) and produce the INPUT that satisfies it.
+- Fuzz inputs are usually STRUCTURED: a header of control fields then a body.
+  A feature is often gated by a header bit/field, not the body alone.
+- Prefer inputs that are VALID enough to drive the target deep (so the gated
+  code actually runs) over random bytes.
 
 YOUR TOOLSET:
-- get_corpus_coverage: execute every seed via afl-showmap, get real edge data.
-- map_coverage_to_functionality: LLM analysis -> which functionality is
-  covered, which is a NEAR MISS (close but unreached), with input hints.
-- propose_new_attack_surfaces: LLM analysis -> wholly new input classes
-  (use when near-miss exploration is exhausted / plateaued).
-- generate_inputs(strategy): create candidates from hypotheses ("neighbor")
-  or from new surfaces ("surface").
-- validate_candidates: execute candidates, keep only coverage-adding ones.
-  Ground truth. LLM guesses are worthless until validated.
+- get_corpus_coverage: real edge data for the current corpus.
+- hunt: DIRECTED hunt — the primary weapon. It picks unreached in-scope
+  features, reads their source, constructs an input that reaches each one,
+  validates against the live campaign, and STOPS as soon as a feature is
+  unlocked. It loops over several dark features by itself; if all fail it
+  reports which preconditions were wrong.
+- map_coverage_to_functionality: reads the coverage digest + source, and
+  returns DARK FEATURES with their gating preconditions and input recipes.
+- propose_new_attack_surfaces: whole new input classes when plateaued.
+- generate_inputs(strategy): LLM-authored candidates ("neighbor"/"surface").
+- control_sweep: convert a feature hypothesis into concrete inputs by setting
+  the harness HEADER control field on real seeds, keeping their body valid. Use
+  this for features gated behind header bits/control fields — byte mutation
+  almost never sets those coherently. (The header layout is configured per
+  target; read the harness source to know which field to set.)
+- validate_candidates: ground truth — a candidate is accepted ONLY if it adds
+  edges the ENTIRE live campaign does not already have.
 - finalize_cycle(summary): persist results. REQUIRED to end the cycle.
 
 DECISION GUIDELINES (you decide, these are not hard rules):
-- Always ground yourself first: get_corpus_coverage before reasoning.
-- Work in iterations: generate -> validate -> look at the verdicts -> adapt.
-  If validation shows your hypothesis was wrong, change approach rather than
-  generating more of the same.
-- If a hypothesis yields nothing new, do not repeat it; pivot to surfaces.
-- Budget your effort: a few well-targeted iterations beat many blind ones.
-- When satisfied (or when nothing more is worth trying), call finalize_cycle
-  with an honest summary of what worked and what did not.
+- Ground yourself first: get_corpus_coverage before reasoning.
+- THEN PREFER hunt: it is the whole point — reach specific unreached features
+  by reasoning about their code, not by guessing. Call hunt once or twice.
+- hunt stops early on success. If it reports "unlocked", you are DONE for this
+  cycle — call finalize_cycle immediately (the fuzzer will mutate the rest).
+- If hunt finds nothing, that is real signal: read its "attempts" and the
+  failed preconditions, then call it again with a different max_targets, or
+  use control_sweep for a header-gated feature, or map_coverage_to_functionality
+  to get fresh recipes. Change your precondition each round; never repeat it.
+- Budget your effort: a few well-targeted, validated attempts beat many blind
+  ones. When satisfied, call finalize_cycle with an honest summary of which
+  FEATURE you tried to unlock and whether it worked.
 
-CONTEXT YOU WILL RECEIVE: current coverage numbers, plateau status from past
-cycles, and hypotheses that previously failed. Use it to avoid repeating
-failed strategies.
+CONTEXT YOU WILL RECEIVE: coverage numbers, dark-feature analysis, plateau
+status from past cycles, and hypotheses that previously failed. Use it to avoid
+repeating failed strategies.
 """
 
 
@@ -63,11 +88,18 @@ def build_brief(mem: Memory, snapshot) -> str:
     recent = mem.summary()
     failed = getattr(mem, "_data", {}).get("failed_hypotheses", [])
     failed_txt = "\n".join(f"- {h}" for h in failed[-10:]) if failed else "(none)"
+    # Durable pre-campaign research notes (codebase + harness understanding).
+    try:
+        from .research import research_brief
+        notes = research_brief()
+    except Exception:
+        notes = ""
+    notes_block = f"\n{notes}\n" if notes else ""
     return f"""\
 CYCLE BRIEF — {time.strftime('%Y-%m-%d %H:%M:%S')}
 
 CORPUS: {len(snapshot.seeds)} seeds, {snapshot.num_edges} edges currently covered.
-
+{notes_block}
 PLATEAU STATUS: {"PLATEAUED — recent cycles produced almost no new edges; mutations of existing seeds are futile. Strongly consider propose_new_attack_surfaces." if plateau else "not plateaued — near-miss exploration is viable."}
 
 RECENT CYCLES:
@@ -88,6 +120,8 @@ def run_agentic_cycle(llm, mem: Memory) -> dict:
     # Ground-truth snapshot for the brief (cheap: also warms up ctx lazily)
     snapshot = analyze()
     ctx: dict[str, Any] = {"memory": mem, "mode": "agentic"}
+    from . import orchestrator as _orc_mod
+    _orc_mod._cycle_ctx = ctx
 
     messages: list[dict] = [
         {"role": "system", "content": AGENT_SYSTEM},
