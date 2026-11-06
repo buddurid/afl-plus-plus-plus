@@ -1,3 +1,21 @@
+# Vision 
+Long fuzzing campaigns eventually hit a coverage
+plateau: mutations keep rediscovering the same behaviors, while entire functionalities stay unreached because
+getting there needs inputs unlike anything in the corpus. this project pairs the fuzzer with an LLM agent that is invoked only when such a plateau is detected, so its cost is paid only when plain mutation has stalled. When triggered, the agent workflow:
+1. inspects the coverage reached so far;
+2. maps that coverage to the codebase’s functionalities, identifying which are exercised and which are not;
+3. generates new corpus entries that exercise the missing functionalities and injects them into the fuzzer’s queue.
+
+Regular mutation then resumes from these new seeds, which can unblock coverage that the fuzzer alone could not reach.
+The project is still under development and is currently being tested on OSS-Fuzz projects. Many of them have been fuzzed continuously for years and are likely to have plateaued, perfect target for us !!
+
+# Current progress 
+Our current target is [libxml2](https://introspector.oss-fuzz.com/project-profile?project=libxml2) , yes it's heavily fuzzed , but that's the exact point xd. If we can squeeze in extra 5-10 % coverage , then we got what we wanted .
+
+currently we're sitting at 1% gained in a 2 hour fuzzing compaign , starting from the plateau'd oss-fuzz [corpus queue](https://storage.googleapis.com/libxml2-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/libxml2_xml/public.zip) . mainly because of bad unstable models (im routing a nerfed deepseek from some chinese router ) . We're still improving the pipeline without exploding it's complexity , to keep token consumption low . 
+
+![stats](/assets/first_coverage.png) 
+
 # Fuzzing Agent
 
 LLM-guided fuzzing orchestrator built on AFL++ (and any OpenAI-compatible LLM endpoint).
